@@ -16,6 +16,7 @@ use super::{peer_connection::DisconnectReason, peer_protocol::PeerMessage};
 
 pub const UT_METADATA: &str = "ut_metadata";
 pub const UPLOAD_ONLY: &str = "upload_only";
+pub const LT_DONTHAVE: &str = "lt_donthave";
 
 pub fn init_extension<'state>(
     id: u8,
@@ -48,12 +49,13 @@ pub fn init_extension<'state>(
             Ok(Some(Box::new(metadata)))
         }
         UPLOAD_ONLY => Ok(Some(Box::new(UploadOnlyExtension::new(id)))),
+        LT_DONTHAVE => Ok(Some(Box::new(DontHaveExtension::new()))),
         _ => Ok(None),
     }
 }
 
 // Supported extensions and this clients ID for them
-pub const EXTENSIONS: [(&str, u8); 2] = [(UT_METADATA, 1), (UPLOAD_ONLY, 2)];
+pub const EXTENSIONS: [(&str, u8); 3] = [(UT_METADATA, 1), (UPLOAD_ONLY, 2), (LT_DONTHAVE, 3)];
 
 /// The handshake message this peer should send to anyone supporting the
 /// extension
@@ -145,6 +147,70 @@ impl ExtensionProtocol for UploadOnlyExtension {
 
     fn on_torrent_complete(&mut self, outgoing_msgs_buffer: &mut Vec<PeerMessage>) {
         outgoing_msgs_buffer.push(self.upload_only(true));
+    }
+}
+
+/// BEP 54 - the `lt_donthave` extension.
+///
+/// The inverse of the `have` message defined in BEP 3: a peer sends it to tell
+/// us it no longer has a piece it previously advertised. The payload is a single
+/// unsigned 32 bit integer, the piece index, in big endian byte order.
+///
+/// We only ever advertise pieces we've downloaded and verified and never drop
+/// them again, so there's no need to send this message ourselves, we only handle
+/// the incoming case to keep our view of peer availability accurate.
+pub struct DontHaveExtension;
+
+impl DontHaveExtension {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DontHaveExtension {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtensionProtocol for DontHaveExtension {
+    fn handle_message<'state>(
+        &mut self,
+        mut data: Bytes,
+        state: &mut StateRef<'state>,
+        connection: &mut PeerConnection,
+    ) -> Result<(), DisconnectReason> {
+        let index = data
+            .try_get_i32()
+            .map_err(|_err| DisconnectReason::InvalidMessage)?;
+        let Some(torrent_state) = state.state() else {
+            // Without metadata we can't track piece availability yet, the hint
+            // is best-effort so simply ignore it.
+            return Ok(());
+        };
+        if index < 0 || index as usize >= torrent_state.num_pieces() {
+            return Err(DisconnectReason::ProtocolError(
+                "Invalid lt_donthave piece index",
+            ));
+        }
+        let index = index as usize;
+        log::debug!(
+            "[Peer: {}] no longer has piece with index: {index}",
+            connection.peer_id
+        );
+        torrent_state
+            .piece_selector
+            .unset_peer_piece(connection.conn_id, index);
+        // If the peer no longer has any pieces we're interested in let them know
+        // we're no longer interested.
+        let still_interesting = torrent_state
+            .piece_selector
+            .interesting_peer_pieces(connection.conn_id)
+            .is_some_and(|pieces| pieces.any());
+        if connection.is_interesting && !still_interesting {
+            connection.not_interested();
+        }
+        Ok(())
     }
 }
 

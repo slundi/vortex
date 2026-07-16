@@ -185,6 +185,13 @@ impl PieceSelector {
         is_interesting
     }
 
+    // Marks a piece as no longer available from a peer (BEP 54 lt_donthave)
+    pub fn unset_peer_piece(&mut self, connection_id: ConnectionId, piece_index: usize) {
+        if let Some(interesting_pieces) = self.interesting_peer_pieces.get_mut(connection_id) {
+            interesting_pieces.set(piece_index, false);
+        }
+    }
+
     // All interesting peer pieces if a bitfield has been received
     pub fn interesting_peer_pieces(
         &self,

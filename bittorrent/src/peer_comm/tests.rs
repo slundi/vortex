@@ -2357,6 +2357,181 @@ fn extension_protocol_handshake() {
     });
 }
 
+// BEP 54 lt_donthave: our advertised id for the extension is 3, so a peer sends
+// us lt_donthave messages using id 3.
+const LT_DONTHAVE_ID: u8 = 3;
+// bencoded extension handshake advertising lt_donthave (the peer's id is 4)
+const LT_DONTHAVE_HANDSHAKE: &str = "d1:md11:lt_donthavei4eee";
+
+#[test]
+fn lt_donthave_drops_interest_when_last_piece_removed() {
+    let mut download_state = setup_test();
+
+    rayon::in_place_scope(|scope| {
+        let mut state_ref = download_state.as_ref();
+        let mut pending_disk_operations: Vec<DiskOp> = Vec::new();
+        let mut connections = SlotMap::<ConnectionId, PeerConnection>::with_key();
+        let key_a = connections.insert_with_key(|k| generate_peer(true, k));
+        connections[key_a].extended_extension = true;
+
+        // Register the lt_donthave extension via the extension handshake
+        connections[key_a].handle_message(
+            PeerMessage::Extended {
+                id: 0,
+                data: LT_DONTHAVE_HANDSHAKE.as_bytes().to_vec().into(),
+            },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+        assert!(connections[key_a].extensions.contains_key(&LT_DONTHAVE_ID));
+        assert!(connections[key_a].pending_disconnect.is_none());
+
+        // The peer advertises a single piece, making us interested
+        connections[key_a].handle_message(
+            PeerMessage::Have { index: 7 },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+        sent_and_marked_interested(&connections[key_a]);
+        {
+            let torrent_state = state_ref.state().unwrap();
+            assert!(
+                torrent_state
+                    .piece_selector
+                    .interesting_peer_pieces(key_a)
+                    .unwrap()[7]
+            );
+        }
+        connections[key_a].outgoing_msgs_buffer.clear();
+
+        // The peer no longer has that piece
+        connections[key_a].handle_message(
+            PeerMessage::Extended {
+                id: LT_DONTHAVE_ID,
+                data: 7_i32.to_be_bytes().to_vec().into(),
+            },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+        assert!(connections[key_a].pending_disconnect.is_none());
+        // The piece is no longer available from the peer
+        {
+            let torrent_state = state_ref.state().unwrap();
+            assert!(
+                !torrent_state
+                    .piece_selector
+                    .interesting_peer_pieces(key_a)
+                    .unwrap()[7]
+            );
+        }
+        // Since it was the only interesting piece we're no longer interested
+        sent_and_marked_not_interested(&connections[key_a]);
+    });
+}
+
+#[test]
+fn lt_donthave_keeps_interest_when_other_pieces_remain() {
+    let mut download_state = setup_test();
+
+    rayon::in_place_scope(|scope| {
+        let mut state_ref = download_state.as_ref();
+        let mut pending_disk_operations: Vec<DiskOp> = Vec::new();
+        let mut connections = SlotMap::<ConnectionId, PeerConnection>::with_key();
+        let key_a = connections.insert_with_key(|k| generate_peer(true, k));
+        connections[key_a].extended_extension = true;
+
+        connections[key_a].handle_message(
+            PeerMessage::Extended {
+                id: 0,
+                data: LT_DONTHAVE_HANDSHAKE.as_bytes().to_vec().into(),
+            },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+
+        // The peer has two interesting pieces
+        let num_pieces = state_ref.state().unwrap().num_pieces();
+        let mut field = bitvec::bitvec!(u8, bitvec::order::Msb0; 0; num_pieces);
+        field.set(3, true);
+        field.set(7, true);
+        connections[key_a].handle_message(
+            PeerMessage::Bitfield(field),
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+        sent_and_marked_interested(&connections[key_a]);
+        connections[key_a].outgoing_msgs_buffer.clear();
+
+        // The peer drops one of them
+        connections[key_a].handle_message(
+            PeerMessage::Extended {
+                id: LT_DONTHAVE_ID,
+                data: 3_i32.to_be_bytes().to_vec().into(),
+            },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+        assert!(connections[key_a].pending_disconnect.is_none());
+        {
+            let torrent_state = state_ref.state().unwrap();
+            let interesting = torrent_state
+                .piece_selector
+                .interesting_peer_pieces(key_a)
+                .unwrap();
+            assert!(!interesting[3]);
+            assert!(interesting[7]);
+        }
+        // Still interested since piece 7 remains, no NotInterested sent
+        assert!(connections[key_a].is_interesting);
+        assert!(
+            !connections[key_a]
+                .outgoing_msgs_buffer
+                .contains(&PeerMessage::NotInterested)
+        );
+    });
+}
+
+#[test]
+fn lt_donthave_invalid_index_disconnects() {
+    let mut download_state = setup_test();
+
+    rayon::in_place_scope(|scope| {
+        let mut state_ref = download_state.as_ref();
+        let mut pending_disk_operations: Vec<DiskOp> = Vec::new();
+        let mut connections = SlotMap::<ConnectionId, PeerConnection>::with_key();
+        let key_a = connections.insert_with_key(|k| generate_peer(true, k));
+        connections[key_a].extended_extension = true;
+
+        connections[key_a].handle_message(
+            PeerMessage::Extended {
+                id: 0,
+                data: LT_DONTHAVE_HANDSHAKE.as_bytes().to_vec().into(),
+            },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+
+        let num_pieces = state_ref.state().unwrap().num_pieces() as i32;
+        connections[key_a].handle_message(
+            PeerMessage::Extended {
+                id: LT_DONTHAVE_ID,
+                data: num_pieces.to_be_bytes().to_vec().into(),
+            },
+            &mut state_ref,
+            &mut pending_disk_operations,
+            scope,
+        );
+        assert!(connections[key_a].pending_disconnect.is_some());
+    });
+}
+
 #[test]
 fn extension_handshake_with_reqq() {
     let mut download_state = setup_test();
